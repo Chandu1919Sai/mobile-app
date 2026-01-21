@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Local env / secrets
+.env
+
+# OS / editor
+.DS_Store
+Thumbs.db
+
+# App runtime uploads (should not be committed)
+uploads/*
+!uploads/.gitkeep
+
+# Binaries
+*.exe
+
