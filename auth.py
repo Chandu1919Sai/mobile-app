@@ -16,7 +16,7 @@ def verify_password(raw, hashed):
 
 def create_token(data: dict, minutes: int):
     payload = data.copy()
-    payload["exp"] = datetime.utcnow() + timedelta(minutes=300)
+    payload["exp"] = datetime.utcnow() + timedelta(minutes=1000)
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
 def decode_token(token: str):

@@ -5,14 +5,15 @@ from typing import Optional
 
 from fastapi import (
     FastAPI, Depends, HTTPException, status,
-    UploadFile, File, Form
+    UploadFile, File, Form, Query, Body
 )
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
+from pydantic import BaseModel
 
 from database import Base, engine, SessionLocal
-from models import User, Attendance, Holiday, Shift
+from models import User, Attendance, Holiday, Shift, LeaveRequest, LeaveTypeEnum
 from schemas import SignupSchema, AttendanceMarkSchema
 from auth import hash_password, verify_password, create_token, decode_token
 
@@ -123,6 +124,7 @@ def signup(data: SignupSchema, db: Session = Depends(get_db)):
         password=hash_password(data.password),
         role=data.role,
         shift_id=shift_id,
+        date_of_joining=date.today()
     )
     db.add(user)
     db.commit()
@@ -157,7 +159,8 @@ def profile(
         "email": user.email,
         "phone_number": user.phone_number,
         "role": user.role,
-        "profile_image": user.profile_image
+        "profile_image": user.profile_image,
+        "date_of_joining": user.date_of_joining
     }
 
 # ---------------- PROFILE PATCH ----------------
@@ -237,7 +240,8 @@ def check_in(
         user_id=user.id,
         attendance_date=today,
         shift_id=user.shift_id,
-        check_in=datetime.now()
+        sign_in_time=datetime.now(),
+        type="PRESENT"
     )
     db.add(attendance)
     db.commit()
@@ -281,43 +285,48 @@ def attendance_mark(
     ).first()
 
     if data.status == "check_in":
-        if attendance and attendance.check_in:
+        if attendance and attendance.sign_in_time:
             raise HTTPException(status_code=400, detail="Already checked in")
 
         if not attendance:
             attendance = Attendance(
                 user_id=user.id,
                 attendance_date=attendance_date,
-                shift_id=user.shift_id
+                shift_id=user.shift_id,
+                sign_in_time=ts,
+                type="PRESENT"
             )
             db.add(attendance)
-
-        attendance.check_in = ts
+        else:
+            attendance.sign_in_time = ts
+            attendance.type = "PRESENT"
+        
         db.commit()
         return {"message": "Check-in successful", "attendance_date": attendance_date}
 
     # check_out
-    if not attendance or not attendance.check_in:
+    if not attendance or not attendance.sign_in_time:
         raise HTTPException(status_code=400, detail="Check-in missing (cannot check out before check-in)")
 
-    if attendance.check_out:
+    if attendance.sign_out_time:
         raise HTTPException(status_code=400, detail="Already checked out")
 
-    attendance.check_out = ts
-    hours = (attendance.check_out - attendance.check_in).total_seconds() / 3600
-    attendance.worked_hours = round(hours, 2)
-    attendance.status = (
-        "Present" if hours >= 9 else
-        "Half-Day" if hours >= 4.5 else
-        "Absent"
+    attendance.sign_out_time = ts
+    hours = (attendance.sign_out_time - attendance.sign_in_time).total_seconds() / 3600
+    shift = db.query(Shift).get(user.shift_id)
+    min_hours = (shift.min_hours if shift and shift.min_hours else 9)
+    half_day_hours = min_hours / 2
+    attendance.type = (
+        "PRESENT" if hours >= min_hours else
+        "HALF_DAY" if hours >= half_day_hours else
+        "ABSENT"
     )
     db.commit()
 
     return {
         "message": "Check-out successful",
-        "worked_hours": attendance.worked_hours,
-        "status": attendance.status,
-        "attendance_date": attendance_date
+        "attendance_date": attendance_date,
+        "type": attendance.type,
     }
 
 # ---------------- CHECK-OUT ----------------
@@ -335,21 +344,22 @@ def check_out(
         Attendance.attendance_date == today
     ).first()
 
-    if not attendance or not attendance.check_in:
+    if not attendance or not attendance.sign_in_time:
         raise HTTPException(400, "Check-in missing")
 
-    attendance.check_out = datetime.now()
-    hours = (attendance.check_out - attendance.check_in).total_seconds() / 3600
-    attendance.worked_hours = round(hours, 2)
-
-    attendance.status = (
-        "Present" if hours >= 9 else
-        "Half-Day" if hours >= 4.5 else
-        "Absent"
+    attendance.sign_out_time = datetime.now()
+    hours = (attendance.sign_out_time - attendance.sign_in_time).total_seconds() / 3600
+    shift = db.query(Shift).get(user.shift_id)
+    min_hours = (shift.min_hours if shift and shift.min_hours else 9)
+    half_day_hours = min_hours / 2
+    attendance.type = (
+        "PRESENT" if hours >= min_hours else
+        "HALF_DAY" if hours >= half_day_hours else
+        "ABSENT"
     )
 
     db.commit()
-    return {"worked_hours": attendance.worked_hours, "status": attendance.status}
+    return {"message": "Check-out successful", "type": attendance.type}
 
 # ---------------- DAY TYPE ----------------
 
@@ -366,37 +376,69 @@ def get_day_type(user: User, day: date, db: Session):
 # ---------------- MONTHLY CALENDAR ----------------
 
 @app.get("/attendance/calendar")
-def monthly_calendar(
+def attendance_calendar(
     year: int,
     month: int,
     token: str = Depends(oauth2_scheme),
     db: Session = Depends(get_db)
 ):
     user = get_current_user_from_token(token, db)
-    calendar = []
-
     ensure_user_shift(user, db)
+
+    # 🔒 Year restriction (same as before)
+    if user.date_of_joining:
+        join_year = user.date_of_joining.year
+        if year < join_year:
+            raise HTTPException(
+                status_code=400,
+                detail="Attendance not available before joining year"
+            )
+
+    calendar = []
+    join_date = user.date_of_joining  # may be None for legacy users
 
     for d in range(1, monthrange(year, month)[1] + 1):
         day = date(year, month, d)
+
+        # ❌ Joining date mundu skip (unchanged)
+        if join_date and day < join_date:
+            continue
+
+        # 🔥 LEAVE CHECK (ADDED – FIRST PRIORITY)
+        leave = db.query(LeaveRequest).filter(
+            LeaveRequest.user_id == user.id,
+            LeaveRequest.status == "APPROVED",
+            LeaveRequest.from_date <= day,
+            LeaveRequest.to_date >= day
+        ).first()
+
+        if leave:
+            calendar.append({
+                "date": day,
+                "sign_in_time": None,
+                "sign_out_time": None,
+                "type": "LEAVE"
+            })
+            continue   # 👈 attendance check skip
+
+        # ✅ EXISTING ATTENDANCE LOGIC (UNCHANGED)
         attendance = db.query(Attendance).filter(
             Attendance.user_id == user.id,
             Attendance.attendance_date == day
         ).first()
 
-        day_type = get_day_type(user, day, db)
-
         calendar.append({
             "date": day,
-            "day": day.strftime("%A"),
-            "shift": db.query(Shift).get(user.shift_id).name,
-            "check_in": attendance.check_in if attendance else None,
-            "check_out": attendance.check_out if attendance else None,
-            "worked_hours": attendance.worked_hours if attendance else 0,
-            "status": attendance.status if attendance else day_type
+            "sign_in_time": attendance.sign_in_time if attendance else None,
+            "sign_out_time": attendance.sign_out_time if attendance else None,
+            "type": attendance.type if attendance else get_day_type(user, day, db)
         })
 
-    return {"calendar": calendar}
+    return {
+        "join_date": join_date,
+        "calendar": calendar
+    }
+
 
 
 # ---------------- ATTENDANCE GET ----------------
@@ -422,8 +464,158 @@ def get_attendance(
     return {
         "date": day,
         "shift": {"id": shift.id, "name": shift.name},
-        "check_in": attendance.check_in if attendance else None,
-        "check_out": attendance.check_out if attendance else None,
-        "worked_hours": attendance.worked_hours if attendance else 0,
-        "status": attendance.status if attendance else day_type
+        "sign_in_time": attendance.sign_in_time if attendance else None,
+        "sign_out_time": attendance.sign_out_time if attendance else None,
+        "type": attendance.type if attendance else day_type,
+   
     }
+
+@app.get("/leave/types")
+def get_leave_types():
+    return [{"value": e.value, "name": e.name} for e in LeaveTypeEnum]
+
+@app.post("/leave/apply")
+def apply_leave(
+    leave_type: str = Form(...),
+    from_date: date = Form(...),
+    to_date: date = Form(...),
+    reason: Optional[str] = Form(None),
+    token: str = Depends(oauth2_scheme),
+    db: Session = Depends(get_db)
+):
+    user = get_current_user_from_token(token, db)
+
+    # Validate leave_type is one of the allowed enum values
+    valid_types = [e.value for e in LeaveTypeEnum]
+    if leave_type not in valid_types:
+        raise HTTPException(400, f"Invalid leave type. Must be one of: {valid_types}")
+
+    # 🔒 joining date check
+    if user.date_of_joining and from_date < user.date_of_joining:
+        raise HTTPException(400, "Leave before joining date not allowed")
+
+    if from_date > to_date:
+        raise HTTPException(400, "Invalid date range")
+
+    # ❌ attendance already marked
+    existing_attendance = db.query(Attendance).filter(
+        Attendance.user_id == user.id,
+        Attendance.attendance_date.between(from_date, to_date)
+    ).first()
+    if existing_attendance:
+        raise HTTPException(400, "Attendance already marked for selected dates")
+
+    leave = LeaveRequest(
+        user_id=user.id,
+        leave_type=leave_type,
+        from_date=from_date,
+        to_date=to_date,
+        reason=reason
+    )
+    db.add(leave)
+    db.commit()
+
+    return {"message": "Leave applied successfully"}
+@app.get("/leave/my")
+def my_leaves(
+    token: str = Depends(oauth2_scheme),
+    db: Session = Depends(get_db)
+):
+    user = get_current_user_from_token(token, db)
+    return db.query(LeaveRequest).filter(
+        LeaveRequest.user_id == user.id
+    ).order_by(LeaveRequest.applied_at.desc()).all()
+@app.get("/admin/leave/pending")
+def get_pending_leaves(
+    admin=Depends(get_current_admin),
+    db: Session = Depends(get_db)
+):
+    return db.query(LeaveRequest).filter(
+        LeaveRequest.status == "PENDING"
+    ).all()
+
+
+class LeaveActionPayload(BaseModel):
+    leave_id: int
+    action: str
+
+
+def process_leave_action(
+    leave_id: int,
+    action: str,
+    db: Session
+):
+    """Shared function to process leave approval/rejection"""
+    leave = db.query(LeaveRequest).filter(
+        LeaveRequest.id == leave_id
+    ).first()
+
+    if not leave:
+        raise HTTPException(
+            status_code=404, 
+            detail=f"Leave request with ID {leave_id} not found"
+        )
+
+    if leave.status != "PENDING":
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Leave request already processed. Current status: {leave.status}"
+        )
+
+    # Accept both "APPROVE"/"REJECT" and "APPROVED"/"REJECTED"
+    action_upper = action.upper().strip()
+
+    if action_upper in ("APPROVE", "APPROVED"):
+        leave.status = "APPROVED"
+    elif action_upper in ("REJECT", "REJECTED"):
+        leave.status = "REJECTED"
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid action '{action}'. Use 'approve' or 'reject'"
+        )
+
+    db.commit()
+    db.refresh(leave)
+
+    return {
+        "message": f"Leave request {leave.status.lower()} successfully",
+        "leave_id": leave.id,
+        "status": leave.status
+    }
+
+@app.put("/admin/leave/action")
+def leave_action_put(
+    leave_id: Optional[int] = Query(None, description="ID of the leave request"),
+    action: Optional[str] = Query(None, description="Action to take: approve or reject"),
+    payload: Optional[LeaveActionPayload] = Body(None),
+    admin=Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Approve or reject a leave request.
+    Preferred usage: PUT with JSON body (or query params).
+    """
+    final_leave_id = leave_id if leave_id is not None else (payload.leave_id if payload else None)
+    final_action = action if action is not None else (payload.action if payload else None)
+
+    if final_leave_id is None or final_action is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Missing required fields: provide 'leave_id' and 'action' as query params or JSON body",
+        )
+
+    return process_leave_action(final_leave_id, final_action, db)
+
+
+@app.get("/admin/leave/action")
+def leave_action_get(
+    leave_id: int = Query(..., description="ID of the leave request"),
+    action: str = Query(..., description="Action to take: approve or reject"),
+    admin=Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Compatibility endpoint (not RESTful): supports older clients that call GET.
+    """
+    return process_leave_action(leave_id, action, db)
